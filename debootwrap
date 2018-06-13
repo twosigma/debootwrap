@@ -1,0 +1,69 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then
+    echo "usage: debootwrap <target directory name>" >&2
+    exit 1
+fi
+
+if [ -e "$1" ]; then
+    echo "debootwrap: error: $1 exists" >&2
+    exit 1
+fi
+
+target="$1"
+
+set -ex
+
+REPO=http://deb.debian.org/debian
+DIST=stretch
+
+bubblewrap () {
+    env -i LANG="$LANG" \
+           USER=root \
+           TERM="$TERM" \
+           LOGNAME=root \
+           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    bwrap --unshare-all --share-net \
+          --uid 0 --gid 0 \
+          --seccomp 3 3<seccomp-filter \
+          "$@"
+}
+
+mkdir -p "$target"
+bubblewrap --ro-bind /usr /usr \
+           --ro-bind /lib /lib \
+           --ro-bind /lib64 /lib64 \
+           --ro-bind /bin /bin \
+           --ro-bind /sbin /sbin \
+           --ro-bind /bin/true /bin/mknod \
+           --proc /proc \
+           --dev /dev \
+           --bind "$target" /target \
+           --file 4 4</etc/resolv.conf /etc/resolv.conf \
+           --file 5 5</etc/ld.so.cache /etc/ld.so.cache \
+           /usr/sbin/debootstrap --foreign "$DIST" /target "$REPO"
+
+tar czf "$target"/debootstrap/devices.tar.gz -T /dev/null
+sed -i 's/^Version.*/Version: 1.18.24/' "$target"/var/lib/dpkg/status # XXX needed on Wheezy, not sure why
+if dpkg --compare-versions "$(dpkg-query -Wf '${Version}' debootstrap)" lt 1.0.72~; then
+    patch "$target"/debootstrap/functions < pre-depends.patch
+fi
+echo 'setup_proc () { :; }' >> "$target"/debootstrap/functions
+cp "$target"/bin/true "$target"/bin/mknod # will be reverted when coreutils is re-unpacked
+
+bubblewrap --bind "$target" / \
+           --proc /proc \
+           --dev /dev \
+           /debootstrap/debootstrap --second-stage
+
+echo 'APT::Sandbox::User "root";' > "$target"/etc/apt/apt.conf.d/99nosandbox
+echo "deb $REPO $DIST main" > "$target"/etc/apt/sources.list
+getent passwd "$(id -un)" >> "$target"/etc/passwd
+getent group "$(id -gn)" >> "$target"/etc/group
+
+cp run.sh "$target"
+
+"$target"/run.sh --root apt-get update
+"$target"/run.sh --root apt-get -y install locales
+sed -i 's/# \(en_US.UTF-8.*\)/\1/' "$target"/etc/locale.gen
+"$target"/run.sh --root locale-gen
